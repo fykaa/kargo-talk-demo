@@ -1,0 +1,191 @@
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Project
+metadata:
+  name: kargo-demo
+---
+apiVersion: v1
+kind: Secret
+type: Opaque
+metadata:
+  name: kargo-demo-repo
+  namespace: kargo-demo
+  labels:
+    kargo.akuity.io/cred-type: git
+stringData:
+  repoURL: ${GITOPS_REPO_URL}
+  username: ${GITHUB_USERNAME}
+  password: ${GITHUB_PAT}
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: kargo-demo
+  namespace: kargo-demo
+spec:
+  subscriptions:
+  - image:
+      repoURL: public.ecr.aws/nginx/nginx
+      constraint: ^1.26.0
+      discoveryLimit: 5
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: PromotionTask
+metadata:
+  name: demo-promo-process
+  namespace: kargo-demo
+spec:
+  vars:
+  - name: gitopsRepo
+    value: ${GITOPS_REPO_URL}
+  - name: imageRepo
+    value: public.ecr.aws/nginx/nginx
+  steps:
+  - uses: git-clone
+    config:
+      repoURL: ${{ vars.gitopsRepo }}
+      checkout:
+      - branch: main
+        path: ./src
+      - branch: stage/${{ ctx.stage }}
+        create: true
+        path: ./out
+  - uses: git-clear
+    config:
+      path: ./out
+  - uses: kustomize-set-image
+    as: update
+    config:
+      path: ./src/base
+      images:
+      - image: ${{ vars.imageRepo }}
+        tag: ${{ imageFrom(vars.imageRepo).Tag }}
+  - uses: kustomize-build
+    config:
+      path: ./src/stages/${{ ctx.stage }}
+      outPath: ./out
+    # Test 1: Standard delimiter with evaluated expressions
+  - uses: git-commit
+    as: commit-test-1
+    config:
+      path: ./out
+      message: ${{ 'we updated image to ' + imageFrom(vars.imageRepo).Tag + ' for stage ' + ctx.stage }} #Prints: "we updated image to 1.29.3 for stage test"
+  
+  # Test 2: Alternative delimiter with Go template syntax preserved
+  - uses: git-commit
+    as: commit-test-2
+    config:
+      path: ./out
+      message: $~~ quote("foo {{.bar}}") ~~ # Prints: "foo {{.bar}}"
+  
+  # Test 3: Alternative delimiter with multiple }} sequences
+  - uses: git-commit
+    as: commit-test-3
+    config:
+      path: ./out
+      message: $~~ quote("foo {{.bar}} and {{.baz}}") ~~ # Prints: "foo {{.bar}} and {{.baz}}"
+  
+  # Test 4: Alternative delimiter mixing variables and Go templates
+  - uses: git-commit
+    as: commit-test-4
+    config:
+      path: ./out
+      message: $~~ "Hello, " + ctx.stage + " Stage, preserved literal is " + quote("{{.domain}}") ~~ # Prints: "Hello, test Stage, preserved literal is "{{.domain}}"
+  
+  # Test 5: Standard delimiter with $~~ literal inside
+  - uses: git-commit
+    as: commit-test-5
+    config:
+      path: ./out
+      message: ${{ "This string contains literal $~~ inside it" }} #Prints: "This string contains literal  inside it"
+  
+  # Test 6: Alternative delimiter with ${{ literal inside
+  - uses: git-commit
+    as: commit-test-6
+    config:
+      path: ./out
+      message: $~~ "This string contains literal " + quote("${{") + " inside it" ~~ # Prints: "This string contains literal "${{" inside it"
+
+  - uses: git-commit
+    as: commit
+    config:
+      path: ./out
+      message: ${{ "This string contains literal " + quote("$~~") + " inside it" }} #"This string contains literal "$~~" inside it"
+  
+  # Test 7: Nested object in alternative delimiter (converted to string)
+  - uses: git-commit
+    as: commit-test-7
+    config:
+      path: ./out
+      message: "$~~ quote({'foo': 'bar', 'nested': {'key': 'value'}}) ~~"
+      # These don't work as expected:
+      # message: ${{ quote("{{.tag}}") }} #doesn't work
+      # message: ${{ quote("Updated image to {{.tag}}") }} #doesn't work - }} #doesnt works
+  - uses: git-push
+    config:
+      path: ./out
+  - uses: argocd-update-1
+    config:
+      apps:
+      - name: kargo-demo-${{ ctx.stage }}
+        sources:
+        - repoURL: ${{ vars.gitopsRepo }}
+          desiredRevision: ${{ task.outputs.commit.commit }}
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: test
+  namespace: kargo-demo
+spec:
+  requestedFreight:
+  - origin:
+      kind: Warehouse
+      name: kargo-demo
+    sources:
+      direct: true
+  promotionTemplate:
+    spec:
+      steps:
+      - task:
+          name: demo-promo-process
+        as: promo-process
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: uat
+  namespace: kargo-demo
+spec:
+  requestedFreight:
+  - origin:
+      kind: Warehouse
+      name: kargo-demo
+    sources:
+      stages:
+      - test
+  promotionTemplate:
+    spec:
+      steps:
+      - task:
+          name: demo-promo-process
+        as: promo-process
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod
+  namespace: kargo-demo
+spec:
+  requestedFreight:
+  - origin:
+      kind: Warehouse
+      name: kargo-demo
+    sources:
+      stages:
+      - uat
+  promotionTemplate:
+    spec:
+      steps:
+      - task:
+          name: demo-promo-process
+        as: promo-process
